@@ -18,6 +18,12 @@ pipeline {
         BACKUP_JAR = 'crypto-market-data-backup.jar'
     }
 
+    options {
+        buildDiscarder(logRotator(
+            numToKeepStr: '10',
+            artifactNumToKeepStr: '10'
+        ))
+    }
     stages {
 
         stage('Checkout') {
