@@ -1,6 +1,9 @@
 package com.crypto.marketdata;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -10,10 +13,15 @@ import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Service
 public class CandleStore {
+    private static final Logger log = LoggerFactory.getLogger(CandleStore.class);
+    private static final long MISSING_EVENT_TABLE_WARNING_INTERVAL_MS = 60_000L;
+
     private final JdbcTemplate jdbcTemplate;
+    private final AtomicLong lastMissingEventTableWarningMillis = new AtomicLong(0L);
 
     public CandleStore(JdbcTemplate jdbcTemplate) {
         this.jdbcTemplate = jdbcTemplate;
@@ -83,15 +91,47 @@ public class CandleStore {
     }
 
     private void insertEvent(String symbol, String interval, Instant openTime, Instant closeTime, String source, Instant observedAt) {
-        jdbcTemplate.update("""
-                INSERT INTO market_data_candle_event (
-                    symbol, interval_code, candle_open_time, candle_close_time, source, observed_at, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6))
-                ON DUPLICATE KEY UPDATE
-                    candle_close_time = VALUES(candle_close_time),
-                    observed_at = COALESCE(observed_at, VALUES(observed_at))
-                """, symbol, interval, Timestamp.from(openTime), Timestamp.from(closeTime), source,
-                observedAt == null ? null : Timestamp.from(observedAt));
+        try {
+            jdbcTemplate.update("""
+                    INSERT INTO market_data_candle_event (
+                        symbol, interval_code, candle_open_time, candle_close_time, source, observed_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6))
+                    ON DUPLICATE KEY UPDATE
+                        candle_close_time = VALUES(candle_close_time),
+                        observed_at = COALESCE(observed_at, VALUES(observed_at))
+                    """, symbol, interval, Timestamp.from(openTime), Timestamp.from(closeTime), source,
+                    observedAt == null ? null : Timestamp.from(observedAt));
+        } catch (DataAccessException ex) {
+            if (!isMissingDurableEventTable(ex)) {
+                throw ex;
+            }
+
+            warnMissingDurableEventTable(symbol, interval, openTime);
+        }
+    }
+
+    private boolean isMissingDurableEventTable(DataAccessException ex) {
+        Throwable current = ex;
+        while (current != null) {
+            if (current instanceof java.sql.SQLException sqlException
+                    && (sqlException.getErrorCode() == 1146 || "42S02".equals(sqlException.getSQLState()))) {
+                String message = sqlException.getMessage();
+                return message != null && message.contains("market_data_candle_event");
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    private void warnMissingDurableEventTable(String symbol, String interval, Instant openTime) {
+        long now = System.currentTimeMillis();
+        long previous = lastMissingEventTableWarningMillis.get();
+        if (now - previous >= MISSING_EVENT_TABLE_WARNING_INTERVAL_MS
+                && lastMissingEventTableWarningMillis.compareAndSet(previous, now)) {
+            log.warn("FIX-139 durable event table is missing; candle persistence continues and event creation will retry "
+                            + "on the next closed candle. table=market_data_candle_event, symbol={}, interval={}, openTime={}",
+                    symbol, interval, openTime);
+        }
     }
 
     private BigDecimal decimal(JsonNode node, String field) {
