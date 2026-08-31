@@ -1,0 +1,42 @@
+spring:
+  application:
+    name: crypto-market-data
+  datasource:
+    # FIX-139 collector intentionally writes to the same canonical candle schema.
+    # Schema migrations remain owned by crypto-ai-next Flyway; this service never runs Flyway.
+    url: ${DB_URL:jdbc:mysql://169.58.108.119:3307/crypto_ai_v2?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC}
+    username: ${DB_USERNAME:jean}
+    password: ${DB_PASSWORD:123456}
+    hikari:
+      maximum-pool-size: ${DB_POOL_MAX:6}
+      minimum-idle: ${DB_POOL_MIN:1}
+      connection-timeout: 30000
+
+server:
+  port: ${MARKET_DATA_PORT:8090}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,logfile
+
+logging:
+  file:
+    name: ${LOG_FILE:logs/crypto-market-data.log}
+  logback:
+    rollingpolicy:
+      file-name-pattern: ${LOG_ARCHIVE_PATTERN:logs/crypto-market-data.%d{yyyy-MM-dd}.%i.log.gz}
+      max-file-size: ${LOG_MAX_FILE_SIZE:25MB}
+      max-history: ${LOG_MAX_HISTORY:14}
+      total-size-cap: ${LOG_TOTAL_SIZE_CAP:1GB}
+
+market-data:
+  binance:
+    rest-base-url: ${BINANCE_REST_BASE_URL:https://data-api.binance.vision}
+    websocket-base-url: ${BINANCE_WS_BASE_URL:wss://data-stream.binance.vision:443}
+    intervals: ${BINANCE_INTERVALS:1m,5m,1h,4h}
+    bootstrap-limit: ${BINANCE_BOOTSTRAP_LIMIT:500}
+    reconnect-health-seconds: ${BINANCE_HEALTH_SECONDS:15}
+    config-refresh-seconds: ${BINANCE_CONFIG_REFRESH_SECONDS:30}
+    reconciliation-delay-ms: ${BINANCE_RECONCILIATION_DELAY_MS:60000}
