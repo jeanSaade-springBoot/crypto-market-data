@@ -35,7 +35,7 @@ market-data:
   binance:
     rest-base-url: ${BINANCE_REST_BASE_URL:https://data-api.binance.vision}
     websocket-base-url: ${BINANCE_WS_BASE_URL:wss://data-stream.binance.vision:443}
-    intervals: ${BINANCE_INTERVALS:1m,5m,1h,4h}
+    intervals: ${BINANCE_INTERVALS:1m,5m,15m,1h,4h}
     bootstrap-limit: ${BINANCE_BOOTSTRAP_LIMIT:500}
     reconnect-health-seconds: ${BINANCE_HEALTH_SECONDS:15}
     config-refresh-seconds: ${BINANCE_CONFIG_REFRESH_SECONDS:30}

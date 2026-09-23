@@ -9,7 +9,7 @@ import java.util.List;
 public class MarketDataProperties {
     private String restBaseUrl = "https://data-api.binance.vision";
     private String websocketBaseUrl = "wss://data-stream.binance.vision:443";
-    private List<String> intervals = new ArrayList<>(List.of("1m", "5m", "1h", "4h"));
+    private List<String> intervals = new ArrayList<>(List.of("1m", "5m", "15m", "1h", "4h"));
     private int bootstrapLimit = 500;
     private long reconnectHealthSeconds = 15;
     private long configRefreshSeconds = 30;
