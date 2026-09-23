@@ -9,7 +9,6 @@ import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
-import java.time.Instant;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class BinanceWebSocketHandler extends TextWebSocketHandler {
@@ -17,14 +16,12 @@ public class BinanceWebSocketHandler extends TextWebSocketHandler {
 
     private final ObjectMapper objectMapper;
     private final CandleStore candleStore;
-    private final GapRepairService gapRepairService;
     private final AtomicBoolean connected = new AtomicBoolean(false);
     private volatile WebSocketSession session;
 
-    public BinanceWebSocketHandler(ObjectMapper objectMapper, CandleStore candleStore, GapRepairService gapRepairService) {
+    public BinanceWebSocketHandler(ObjectMapper objectMapper, CandleStore candleStore) {
         this.objectMapper = objectMapper;
         this.candleStore = candleStore;
-        this.gapRepairService = gapRepairService;
     }
 
     @Override
@@ -40,15 +37,12 @@ public class BinanceWebSocketHandler extends TextWebSocketHandler {
             JsonNode root = objectMapper.readTree(message.getPayload());
             JsonNode data = root.has("data") ? root.path("data") : root;
             JsonNode k = data.path("k");
-            if (k.path("x").asBoolean(false)) {
-                String symbol = k.path("s").asText();
-                String interval = k.path("i").asText();
-                Instant openTime = Instant.ofEpochMilli(k.path("t").asLong());
-                gapRepairService.repairBefore(symbol, interval, openTime);
-            }
+            // FIX-228: never put REST repair on the WebSocket callback. A repair timeout used to
+            // skip persistWebsocket(root), dropping the very closed candle being delivered.
             if (candleStore.persistWebsocket(root)) {
                 log.info("FIX-139 durable candle closed: symbol={}, interval={}, openTime={}",
-                        k.path("s").asText(), k.path("i").asText(), Instant.ofEpochMilli(k.path("t").asLong()));
+                        k.path("s").asText(), k.path("i").asText(),
+                        java.time.Instant.ofEpochMilli(k.path("t").asLong()));
             }
         } catch (Exception exception) {
             log.error("FIX-139 failed to persist Binance kline", exception);

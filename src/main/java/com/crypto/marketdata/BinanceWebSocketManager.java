@@ -68,7 +68,7 @@ public class BinanceWebSocketManager {
         try {
             closeCurrent();
             String url = urlBuilder.build(symbols);
-            BinanceWebSocketHandler next = new BinanceWebSocketHandler(objectMapper, candleStore, gapRepairService);
+            BinanceWebSocketHandler next = new BinanceWebSocketHandler(objectMapper, candleStore);
             new StandardWebSocketClient().execute(next, null, URI.create(url))
                     .get(Duration.ofSeconds(15).toMillis(), TimeUnit.MILLISECONDS);
             handler = next;

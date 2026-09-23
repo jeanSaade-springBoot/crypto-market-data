@@ -13,6 +13,8 @@ public class MarketDataProperties {
     private int bootstrapLimit = 500;
     private long reconnectHealthSeconds = 15;
     private long configRefreshSeconds = 30;
+    private int gapLookbackHours = 24;
+    private int maxInternalGapsPerPass = 25;
 
 
     public String getRestBaseUrl() { return restBaseUrl; }
@@ -27,4 +29,8 @@ public class MarketDataProperties {
     public void setReconnectHealthSeconds(long reconnectHealthSeconds) { this.reconnectHealthSeconds = reconnectHealthSeconds; }
     public long getConfigRefreshSeconds() { return configRefreshSeconds; }
     public void setConfigRefreshSeconds(long configRefreshSeconds) { this.configRefreshSeconds = configRefreshSeconds; }
+    public int getGapLookbackHours() { return gapLookbackHours; }
+    public void setGapLookbackHours(int gapLookbackHours) { this.gapLookbackHours = gapLookbackHours; }
+    public int getMaxInternalGapsPerPass() { return maxInternalGapsPerPass; }
+    public void setMaxInternalGapsPerPass(int maxInternalGapsPerPass) { this.maxInternalGapsPerPass = maxInternalGapsPerPass; }
 }

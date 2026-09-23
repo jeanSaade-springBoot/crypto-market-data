@@ -56,45 +56,50 @@ public class GapRepairService {
         if (repaired > 0) {
             log.warn("FIX-139 startup/gap reconciliation repaired candles: symbol={}, interval={}, count={}", symbol, interval, repaired);
         }
+        repairInternalGaps(symbol, interval, observedAt);
     }
 
-    public void repairBefore(String symbol, String interval, Instant incomingOpenTime) {
+    /**
+     * FIX-228: repair holes behind the latest candle. This is deliberately bounded and only calls
+     * Binance when SQL has proved a gap exists; normal reconciliation remains inexpensive.
+     */
+    void repairInternalGaps(String symbol, String interval, Instant observedAt) {
         Duration step = IntervalSupport.duration(interval);
-        var latest = store.latestClosedOpenTime(symbol, interval);
-        if (latest.isEmpty()) {
-            return;
+        int lookbackHours = Math.max(1, Math.min(168, properties.getGapLookbackHours()));
+        int maxGaps = Math.max(1, Math.min(250, properties.getMaxInternalGapsPerPass()));
+        List<CandleStore.CandleGap> gaps = store.findInternalGaps(
+                symbol, interval, observedAt.minus(Duration.ofHours(lookbackHours)), step.toSeconds(), maxGaps);
+        for (CandleStore.CandleGap gap : gaps) {
+            int repaired = repairRange(symbol, interval, gap, observedAt);
+            if (repaired > 0) {
+                log.warn("FIX-228 repaired internal candle gap: symbol={}, interval={}, start={}, endExclusive={}, repaired={}",
+                        symbol, interval, gap.startInclusive(), gap.endExclusive(), repaired);
+            }
         }
-        Instant expected = latest.get().plus(step);
-        if (!incomingOpenTime.isAfter(expected)) {
-            return;
-        }
+    }
 
-        Instant observedAt = Instant.now();
-        Instant cursor = expected;
+    private int repairRange(String symbol, String interval, CandleStore.CandleGap gap, Instant observedAt) {
+        Duration step = IntervalSupport.duration(interval);
+        Instant cursor = gap.startInclusive();
         int repaired = 0;
-        while (cursor.isBefore(incomingOpenTime)) {
+        while (cursor.isBefore(gap.endExclusive())) {
             List<BinanceKline> rows = client.from(symbol, interval, cursor, 1000);
-            if (rows.isEmpty()) {
-                break;
-            }
+            if (rows.isEmpty()) break;
+            Instant lastAccepted = null;
             for (BinanceKline row : rows) {
-                if (!row.openTime().isBefore(incomingOpenTime)) {
-                    returnAfterRepair(symbol, interval, repaired);
-                    return;
-                }
-                if (!row.closeTime().isAfter(observedAt)) {
-                    store.persistRest(symbol, interval, row, "REST_GAP_REPAIR", observedAt);
-                    repaired++;
-                }
+                if (row.openTime().isBefore(cursor)) continue;
+                if (!row.openTime().isBefore(gap.endExclusive())) return repaired;
+                if (row.closeTime().isAfter(observedAt)) return repaired;
+                store.persistRest(symbol, interval, row, "REST_INTERNAL_GAP_REPAIR", observedAt);
+                repaired++;
+                lastAccepted = row.openTime();
             }
-            BinanceKline last = rows.get(rows.size() - 1);
-            Instant candidate = last.openTime().plus(step);
-            if (!candidate.isAfter(cursor)) {
-                break;
-            }
+            if (lastAccepted == null) break;
+            Instant candidate = lastAccepted.plus(step);
+            if (!candidate.isAfter(cursor)) break;
             cursor = candidate;
         }
-        returnAfterRepair(symbol, interval, repaired);
+        return repaired;
     }
 
     private int persistClosed(String symbol, String interval, List<BinanceKline> rows, String source, Instant observedAt) {
@@ -109,9 +114,4 @@ public class GapRepairService {
         return count;
     }
 
-    private void returnAfterRepair(String symbol, String interval, int repaired) {
-        if (repaired > 0) {
-            log.warn("FIX-139 websocket gap repaired before live candle: symbol={}, interval={}, repaired={}", symbol, interval, repaired);
-        }
-    }
 }

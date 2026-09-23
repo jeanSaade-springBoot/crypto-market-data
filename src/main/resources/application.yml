@@ -40,3 +40,6 @@ market-data:
     reconnect-health-seconds: ${BINANCE_HEALTH_SECONDS:15}
     config-refresh-seconds: ${BINANCE_CONFIG_REFRESH_SECONDS:30}
     reconciliation-delay-ms: ${BINANCE_RECONCILIATION_DELAY_MS:60000}
+    # FIX-228: inspect already-persisted history as well as the trailing edge.
+    gap-lookback-hours: ${BINANCE_GAP_LOOKBACK_HOURS:24}
+    max-internal-gaps-per-pass: ${BINANCE_MAX_INTERNAL_GAPS_PER_PASS:25}

@@ -11,6 +11,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.sql.Timestamp;
 import java.time.Instant;
+import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
@@ -68,6 +69,31 @@ public class CandleStore {
                 ORDER BY open_time DESC LIMIT 1
                 """, rs -> rs.next() ? Optional.of(rs.getTimestamp(1).toInstant()) : Optional.empty(), symbol, interval);
     }
+
+    /** FIX-228: find holes inside persisted history; latest-only reconciliation cannot see them. */
+    public List<CandleGap> findInternalGaps(String symbol, String interval, Instant fromInclusive,
+                                            long stepSeconds, int limit) {
+        return jdbcTemplate.query("""
+                SELECT open_time, next_open_time
+                FROM (
+                    SELECT open_time,
+                           LEAD(open_time) OVER (ORDER BY open_time) AS next_open_time
+                    FROM candle
+                    WHERE symbol = ? AND interval_code = ? AND closed = 1
+                      AND open_time >= TIMESTAMPADD(SECOND, -?, ?)
+                ) ordered_candles
+                WHERE next_open_time > TIMESTAMPADD(SECOND, ?, open_time)
+                ORDER BY open_time
+                LIMIT ?
+                """, (rs, rowNum) -> {
+                    Instant previous = rs.getTimestamp("open_time").toInstant();
+                    Instant next = rs.getTimestamp("next_open_time").toInstant();
+                    return new CandleGap(previous.plusSeconds(stepSeconds), next);
+                }, symbol, interval, Math.max(1L, stepSeconds), Timestamp.from(fromInclusive),
+                Math.max(1L, stepSeconds), Math.max(1, Math.min(250, limit)));
+    }
+
+    public record CandleGap(Instant startInclusive, Instant endExclusive) {}
 
     private void upsert(String symbol, String interval, Instant openTime, Instant closeTime,
                         BigDecimal open, BigDecimal high, BigDecimal low, BigDecimal close,
