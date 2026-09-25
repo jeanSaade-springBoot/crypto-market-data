@@ -22,6 +22,21 @@ public class CandleStore {
     private static final long MISSING_EVENT_TABLE_WARNING_INTERVAL_MS = 60_000L;
 
     private final JdbcTemplate jdbcTemplate;
+    @org.springframework.beans.factory.annotation.Autowired
+    private StreamPublisher streamPublisher;
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private io.micrometer.core.instrument.MeterRegistry meters;
+    private void timeTransaction() {
+        if(meters==null || !org.springframework.transaction.support.TransactionSynchronizationManager.isSynchronizationActive())return;
+        long started=System.nanoTime();
+        org.springframework.transaction.support.TransactionSynchronizationManager.registerSynchronization(
+            new org.springframework.transaction.support.TransactionSynchronization() {
+                @Override public void afterCompletion(int status) {
+                    meters.timer("fix132.collector.transaction","outcome",status==STATUS_COMMITTED?"committed":"rolled_back")
+                        .record(System.nanoTime()-started,java.util.concurrent.TimeUnit.NANOSECONDS);
+                }
+            });
+    }
     private final AtomicLong lastMissingEventTableWarningMillis = new AtomicLong(0L);
 
     public CandleStore(JdbcTemplate jdbcTemplate) {
@@ -30,6 +45,7 @@ public class CandleStore {
 
     @Transactional
     public boolean persistWebsocket(JsonNode root) {
+        timeTransaction();
         JsonNode data = root.has("data") ? root.path("data") : root;
         JsonNode k = data.path("k");
         if (k.isMissingNode() || k.isNull()) {
@@ -40,19 +56,27 @@ public class CandleStore {
         Instant open = Instant.ofEpochMilli(k.path("t").asLong());
         Instant close = Instant.ofEpochMilli(k.path("T").asLong());
         boolean closed = k.path("x").asBoolean(false);
+        Instant observed = data.path("E").asLong(0L)>0 ? Instant.ofEpochMilli(data.path("E").asLong()) : null;
+        var stream = streamPublisher == null ? null : streamPublisher.prepare(symbol,interval,open,close,closed,
+                observed,decimal(k,"c"),"LIVE_WEBSOCKET",k.toString());
+        if(stream != null && !stream.accepted()) { streamPublisher.publish(stream); return false; }
         upsert(symbol, interval, open, close,
                 decimal(k, "o"), decimal(k, "h"), decimal(k, "l"), decimal(k, "c"),
                 decimal(k, "v"), decimal(k, "q"), k.path("n").asLong(), decimal(k, "V"), decimal(k, "Q"), closed);
         if (closed) {
-            Instant observed = data.path("E").asLong(0L) > 0 ? Instant.ofEpochMilli(data.path("E").asLong()) : Instant.now();
-            insertEvent(symbol, interval, open, close, "LIVE_WEBSOCKET", observed);
+            insertEvent(symbol, interval, open, close, "LIVE_WEBSOCKET", observed == null ? Instant.now() : observed);
         }
+        if(streamPublisher != null) streamPublisher.publish(stream);
         return closed;
     }
 
     @Transactional
     public void persistRest(String symbol, String interval, BinanceKline kline, String source, Instant observedAt) {
+        timeTransaction();
         boolean closed = !kline.closeTime().isAfter(observedAt);
+        var stream = streamPublisher == null ? null : streamPublisher.prepare(symbol,interval,kline.openTime(),kline.closeTime(),closed,
+                observedAt,kline.closePrice(),source,kline.toString());
+        if(stream != null && !stream.accepted()) { streamPublisher.publish(stream); return; }
         upsert(symbol, interval, kline.openTime(), kline.closeTime(),
                 kline.openPrice(), kline.highPrice(), kline.lowPrice(), kline.closePrice(),
                 kline.volume(), kline.quoteAssetVolume(), kline.numberOfTrades(),
@@ -60,6 +84,7 @@ public class CandleStore {
         if (closed) {
             insertEvent(symbol, interval, kline.openTime(), kline.closeTime(), source, observedAt);
         }
+        if(streamPublisher != null) streamPublisher.publish(stream);
     }
 
     public Optional<Instant> latestClosedOpenTime(String symbol, String interval) {

@@ -3,6 +3,7 @@ package com.crypto.marketdata;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.socket.TextMessage;
+import org.springframework.web.socket.WebSocketSession;
 
 import static org.mockito.Mockito.*;
 
@@ -18,7 +19,9 @@ class BinanceWebSocketHandlerTest {
                 "t":1790151840000,"T":1790151899999,"x":true}}}
                 """;
 
-        handler.handleTextMessage(null, new TextMessage(payload));
+        WebSocketSession session = mock(WebSocketSession.class);
+        handler.afterConnectionEstablished(session);
+        handler.handleTextMessage(session, new TextMessage(payload));
 
         verify(store).persistWebsocket(any());
     }

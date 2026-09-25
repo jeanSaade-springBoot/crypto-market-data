@@ -7,7 +7,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
-import org.springframework.web.socket.client.standard.StandardWebSocketClient;
 
 import java.net.URI;
 import java.time.Duration;
@@ -23,12 +22,12 @@ public class BinanceWebSocketManager {
     private final MarketDataProperties properties;
     private final CoinConfigurationReader coinReader;
     private final BinanceStreamUrlBuilder urlBuilder;
-    private final ObjectMapper objectMapper;
-    private final CandleStore candleStore;
     private final GapRepairService gapRepairService;
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
-    private volatile BinanceWebSocketHandler handler;
+    private final CollectorConnectionOwner owner;
+    private final CollectorWebSocketTransport transport = new CollectorWebSocketTransport();
+    private volatile boolean stopped;
     private volatile List<String> connectedSymbols = List.of();
 
     public BinanceWebSocketManager(MarketDataProperties properties, CoinConfigurationReader coinReader,
@@ -37,9 +36,9 @@ public class BinanceWebSocketManager {
         this.properties = properties;
         this.coinReader = coinReader;
         this.urlBuilder = urlBuilder;
-        this.objectMapper = objectMapper;
-        this.candleStore = candleStore;
         this.gapRepairService = gapRepairService;
+        this.owner = new CollectorConnectionOwner(objectMapper, candleStore,
+                transport, Duration.ofSeconds(15));
     }
 
     @EventListener(ApplicationReadyEvent.class)
@@ -47,6 +46,7 @@ public class BinanceWebSocketManager {
         List<String> symbols = coinReader.enabledSymbols();
         reconcileAll(symbols);
         connect(symbols);
+        if (stopped) return;
         scheduler.scheduleWithFixedDelay(this::healthCheck,
                 properties.getReconnectHealthSeconds(), properties.getReconnectHealthSeconds(), TimeUnit.SECONDS);
         scheduler.scheduleWithFixedDelay(this::refreshConfiguration,
@@ -64,32 +64,31 @@ public class BinanceWebSocketManager {
         }
     }
 
-    private synchronized void connect(List<String> symbols) {
-        try {
-            closeCurrent();
-            String url = urlBuilder.build(symbols);
-            BinanceWebSocketHandler next = new BinanceWebSocketHandler(objectMapper, candleStore);
-            new StandardWebSocketClient().execute(next, null, URI.create(url))
-                    .get(Duration.ofSeconds(15).toMillis(), TimeUnit.MILLISECONDS);
-            handler = next;
+    private void connect(List<String> symbols) {
+        if (stopped) return;
+        if (owner.connect(URI.create(urlBuilder.build(symbols))) == CollectorConnectionOwner.Outcome.CONNECTED) {
             connectedSymbols = List.copyOf(symbols);
-            log.info("FIX-139 Binance candle collector connected: symbols={}, intervals={}", connectedSymbols, properties.getIntervals());
-        } catch (Exception exception) {
-            handler = null;
-            log.error("FIX-139 unable to connect Binance candle collector", exception);
+            log.info("[FIX-132][SOURCE_CONFIGURATION] collector connected: symbols={}, intervals={}",
+                    connectedSymbols, properties.getIntervals());
         }
     }
 
     private void healthCheck() {
-        BinanceWebSocketHandler current = handler;
-        if (current == null || !current.isConnected()) {
-            List<String> symbols = coinReader.enabledSymbols();
-            reconcileAll(symbols);
-            connect(symbols);
+        if (stopped) return;
+        try {
+            if (!owner.isConnected()) {
+                List<String> symbols = coinReader.enabledSymbols();
+                reconcileAll(symbols);
+                connect(symbols);
+            }
+        } catch (RuntimeException exception) {
+            // A failed symbol query must not cancel all future fixed-delay checks.
+            log.error("[FIX-132][HEALTH_CHECK_FAILED] collector will retry on next check", exception);
         }
     }
 
     private void refreshConfiguration() {
+        if (stopped) return;
         try {
             List<String> symbols = coinReader.enabledSymbols();
             if (!symbols.equals(connectedSymbols)) {
@@ -102,15 +101,11 @@ public class BinanceWebSocketManager {
         }
     }
 
-    private synchronized void closeCurrent() {
-        BinanceWebSocketHandler current = handler;
-        handler = null;
-        if (current != null) current.close();
-    }
-
     @PreDestroy
     public void stop() {
-        closeCurrent();
+        stopped = true;
+        owner.stop();
         scheduler.shutdownNow();
+        transport.close();
     }
 }

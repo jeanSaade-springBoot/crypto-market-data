@@ -9,66 +9,123 @@ import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
-import java.util.concurrent.atomic.AtomicBoolean;
-
+/** FIX-132 collector prerequisite: a revoked connection can never admit another write.
+ * Admission and revocation share one monitor, but database work never holds it.
+ * An already admitted persistence call must return (including Spring commit/rollback)
+ * before the manager is allowed to create a replacement generation.
+ */
 public class BinanceWebSocketHandler extends TextWebSocketHandler {
     private static final Logger log = LoggerFactory.getLogger(BinanceWebSocketHandler.class);
-
     private final ObjectMapper objectMapper;
     private final CandleStore candleStore;
-    private final AtomicBoolean connected = new AtomicBoolean(false);
-    private volatile WebSocketSession session;
+    private final long generation;
+    private WebSocketSession session;
+    private boolean revoked;
+    private int inFlight;
 
     public BinanceWebSocketHandler(ObjectMapper objectMapper, CandleStore candleStore) {
+        this(objectMapper, candleStore, 0);
+    }
+
+    BinanceWebSocketHandler(ObjectMapper objectMapper, CandleStore candleStore, long generation) {
         this.objectMapper = objectMapper;
         this.candleStore = candleStore;
+        this.generation = generation;
     }
 
     @Override
-    public void afterConnectionEstablished(WebSocketSession session) {
-        this.session = session;
-        connected.set(true);
-        log.info("FIX-139 connected to Binance candle websocket: session={}", session.getId());
+    public void afterConnectionEstablished(WebSocketSession established) {
+        boolean reject;
+        boolean newlyEstablished;
+        synchronized (this) {
+            // A timeout/shutdown may have won before the provider reports success.
+            // A duplicate callback for our own session is harmless; a distinct extra
+            // session is closed without taking ownership away from the real session.
+            reject = revoked || (session != null && session != established);
+            newlyEstablished = !reject && session == null;
+            if (!reject) session = established;
+        }
+        if (reject) {
+            log.warn("[FIX-132][WS-LIFECYCLE][REJECTED_ESTABLISHMENT] generation={}, session={}",
+                    generation, established.getId());
+            closeSession(established);
+        } else if (newlyEstablished) {
+            log.info("[FIX-132][WS-LIFECYCLE][ESTABLISHED] generation={}, session={}",
+                    generation, established.getId());
+        }
     }
 
     @Override
-    protected void handleTextMessage(WebSocketSession session, TextMessage message) {
+    protected void handleTextMessage(WebSocketSession source, TextMessage message) {
+        synchronized (this) {
+            if (revoked || session == null || session != source) return;
+            inFlight++;
+        }
+        long started = System.nanoTime();
         try {
             JsonNode root = objectMapper.readTree(message.getPayload());
             JsonNode data = root.has("data") ? root.path("data") : root;
             JsonNode k = data.path("k");
-            // FIX-228: never put REST repair on the WebSocket callback. A repair timeout used to
-            // skip persistWebsocket(root), dropping the very closed candle being delivered.
+            // FIX-228 retained: REST repair never runs on the callback thread.
             if (candleStore.persistWebsocket(root)) {
                 log.info("FIX-139 durable candle closed: symbol={}, interval={}, openTime={}",
                         k.path("s").asText(), k.path("i").asText(),
                         java.time.Instant.ofEpochMilli(k.path("t").asLong()));
             }
         } catch (Exception exception) {
-            log.error("FIX-139 failed to persist Binance kline", exception);
+            log.error("[FIX-132][CANDLE_PERSIST_FAILED] generation={}; candle may be missing", generation, exception);
+        } finally {
+            synchronized (this) {
+                inFlight--;
+                notifyAll();
+            }
+            long elapsed = (System.nanoTime() - started) / 1_000_000;
+            if (elapsed >= 1_000) {
+                log.warn("[FIX-132][CALLBACK_SLOW] generation={}, persistenceReturnMs={}", generation, elapsed);
+            }
         }
     }
 
     @Override
-    public void handleTransportError(WebSocketSession session, Throwable exception) {
-        connected.set(false);
-        log.error("FIX-139 Binance websocket transport error", exception);
+    public void handleTransportError(WebSocketSession source, Throwable exception) {
+        if (!owns(source)) return;
+        log.error("[FIX-132][WS-LIFECYCLE][TRANSPORT_ERROR] generation={}", generation, exception);
+        close();
     }
 
     @Override
-    public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
-        connected.set(false);
-        log.warn("FIX-139 Binance websocket disconnected: {}", status);
+    public void afterConnectionClosed(WebSocketSession source, CloseStatus status) {
+        synchronized (this) {
+            if (session != source) return; // late callback from an extra session is not authoritative
+            revoked = true;
+        }
+        log.warn("[FIX-132][WS-LIFECYCLE][CLOSED] generation={}, status={}", generation, status);
     }
 
-    public boolean isConnected() { return connected.get(); }
+    private synchronized boolean owns(WebSocketSession source) { return session != null && session == source; }
+    public synchronized boolean isConnected() { return !revoked && session != null && session.isOpen(); }
+    synchronized boolean isDrained() { return revoked && inFlight == 0; }
+    synchronized boolean isTransportClosed() { return session == null || !session.isOpen(); }
+    synchronized int inFlight() { return inFlight; }
 
     public void close() {
-        connected.set(false);
-        WebSocketSession current = session;
-        if (current != null && current.isOpen()) {
-            try { current.close(CloseStatus.NORMAL); }
-            catch (Exception exception) { log.warn("Unable to close Binance websocket cleanly", exception); }
+        WebSocketSession current;
+        synchronized (this) {
+            revoked = true;
+            current = session;
+        }
+        // Network close may call us back; never hold the admission monitor across it.
+        if (current != null) closeSession(current);
+    }
+
+    private void closeSession(WebSocketSession value) {
+        try {
+            if (value.isOpen()) value.close(CloseStatus.NORMAL);
+        } catch (Exception exception) {
+            // Transport closure and processing revocation are separate. Even a failed
+            // socket close cannot re-enable this generation's database writes.
+            log.warn("[FIX-132][WS-LIFECYCLE][CLOSE_FAILED] generation={}, session={}",
+                    generation, value.getId(), exception);
         }
     }
 }
