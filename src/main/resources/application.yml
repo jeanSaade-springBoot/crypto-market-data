@@ -45,7 +45,7 @@ logging:
 market-data:
   # FIX-132 additive publication, requires explicit source-schema setup.
   stream:
-    enabled: ${MARKET_DATA_STREAM_ENABLED:false}
+    enabled: ${MARKET_DATA_STREAM_ENABLED:true}
   binance:
     rest-base-url: ${BINANCE_REST_BASE_URL:https://data-api.binance.vision}
     websocket-base-url: ${BINANCE_WS_BASE_URL:wss://data-stream.binance.vision:443}
