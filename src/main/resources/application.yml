@@ -16,6 +16,17 @@ server:
   port: ${MARKET_DATA_PORT:8090}
 
 management:
+  # FIX-132 ownership waiting is NOT a liveness failure.
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include: readinessState,collectorIngestion
+          show-details: always
+        liveness:
+          include: livenessState
   endpoints:
     web:
       exposure:

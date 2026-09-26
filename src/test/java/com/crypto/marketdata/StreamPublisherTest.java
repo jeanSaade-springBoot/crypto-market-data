@@ -14,7 +14,7 @@ import java.time.Instant;
 import static org.junit.jupiter.api.Assertions.*;
 
 class StreamPublisherTest {
-    JdbcTemplate jdbc; TransactionTemplate tx; CandleStore store; StreamPublisher publisher;
+    JdbcTemplate jdbc; TransactionTemplate tx; CandleStore store; StreamPublisher publisher; OwnershipGate gate; String token="test-owner";
     @BeforeEach void setup() throws Exception {
         var ds=new DriverManagerDataSource("jdbc:h2:mem:"+UUID.randomUUID()+";MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1","sa","");
         jdbc=new JdbcTemplate(ds);tx=new TransactionTemplate(new DataSourceTransactionManager(ds));
@@ -28,11 +28,14 @@ class StreamPublisherTest {
         String ddl=Files.readString(Path.of("md/sql/FIX-132-source-tables.sql")).replaceAll("(?m)^--.*$","");
         for(String statement:ddl.split(";"))if(!statement.isBlank())jdbc.execute(statement);
         publisher=new StreamPublisher(jdbc,new MockEnvironment().withProperty("market-data.stream.enabled","true"));
+        gate=new OwnershipGate(true);gate.acquired(token);
+        jdbc.update("INSERT INTO market_data_stream_owner VALUES(1,?,TIMESTAMPADD(SECOND,30,CURRENT_TIMESTAMP))",token);
+        ReflectionTestUtils.setField(publisher,"gate",gate);
         store=new CandleStore(jdbc);ReflectionTestUtils.setField(store,"streamPublisher",publisher);
     }
     void write(long observed,boolean closed,String price) throws Exception {
         var json=new ObjectMapper().readTree("{\"E\":"+observed+",\"k\":{\"s\":\"BTCUSDT\",\"i\":\"1m\",\"t\":1000,\"T\":60999,\"x\":"+closed+",\"c\":\""+price+"\"}}");
-        tx.executeWithoutResult(status->store.persistWebsocket(json));
+        try(var permit=gate.admit()){tx.executeWithoutResult(status->store.persistWebsocket(json));}
     }
     @Test void offRequiresNoFeedTables() throws Exception {
         for(String table:new String[]{"market_data_stream_event","market_data_stream_version","market_data_stream_cursor","market_data_stream_owner","market_data_stream_lane"})jdbc.execute("DROP TABLE "+table);
@@ -58,21 +61,39 @@ class StreamPublisherTest {
     }
     @Test void secondPublisherCannotWriteWhileOwnerLeaseIsValid() throws Exception {
         write(2000,false,"1");
-        ReflectionTestUtils.setField(store,"streamPublisher",new StreamPublisher(jdbc,new MockEnvironment().withProperty("market-data.stream.enabled","true")));
+        jdbc.update("UPDATE market_data_stream_owner SET owner_token='successor'");
         assertThrows(IllegalStateException.class,()->write(3000,false,"2"));
         assertEquals(1L,jdbc.queryForObject("SELECT last_sequence FROM market_data_stream_cursor",Long.class));
     }
     @Test void repairIsHistoricalEvenWithHigherSequence() throws Exception {
         write(2000,false,"1");
-        tx.executeWithoutResult(status->{var e=publisher.prepare("BTCUSDT","1m",Instant.ofEpochMilli(1000),Instant.ofEpochMilli(60999),true,
-            Instant.now(),java.math.BigDecimal.TEN,"REST_REPAIR","repair");publisher.publish(e);});
+        try(var permit=gate.admit()){tx.executeWithoutResult(status->{var e=publisher.prepare("BTCUSDT","1m",Instant.ofEpochMilli(1000),Instant.ofEpochMilli(60999),true,
+            Instant.now(),java.math.BigDecimal.TEN,"REST_REPAIR","repair");publisher.publish(e);});}
         assertEquals("HISTORICAL_ONLY",jdbc.queryForObject("SELECT classification FROM market_data_stream_event WHERE symbol_sequence=2",String.class));
     }
 
+    @Test void expiredFenceDoesNotAcquireOrRenew() {
+        jdbc.update("UPDATE market_data_stream_owner SET expires_at=TIMESTAMP '2000-01-01 00:00:00'");
+        assertThrows(IllegalStateException.class,()->write(2000,false,"1"));
+        assertEquals(OwnershipGate.State.OWNERSHIP_LOST,gate.state());
+        assertEquals(token,jdbc.queryForObject("SELECT owner_token FROM market_data_stream_owner",String.class));
+        assertEquals(2000,jdbc.queryForObject("SELECT YEAR(expires_at) FROM market_data_stream_owner",Integer.class));
+        assertEquals(0,jdbc.queryForObject("SELECT COUNT(*) FROM candle",Integer.class));
+    }
+    @Test void admittedTokenSurvivesRevocation() throws Exception {
+        try(var permit=gate.admit()){
+            gate.uncertain("test");
+            var json=new ObjectMapper().readTree("{\"E\":2000,\"k\":{\"s\":\"BTCUSDT\",\"i\":\"1m\",\"t\":1000,\"T\":60999,\"c\":\"1\"}}");
+            tx.executeWithoutResult(status->store.persistWebsocket(json));
+            assertEquals(token,permit.token());
+            assertNull(gate.admit());
+        }
+        assertEquals(1,jdbc.queryForObject("SELECT COUNT(*) FROM candle",Integer.class));
+    }
     @Test void delayedDifferentCandleIsStoredAsHistoryWithoutReorderingLiveLane() throws Exception {
         write(100000,false,"1");
         var older=new ObjectMapper().readTree("{\"E\":61000,\"k\":{\"s\":\"BTCUSDT\",\"i\":\"1m\",\"t\":0,\"T\":59999,\"x\":true,\"c\":\"2\"}}");
-        tx.executeWithoutResult(status->store.persistWebsocket(older));
+        try(var permit=gate.admit()){tx.executeWithoutResult(status->store.persistWebsocket(older));}
         assertEquals(2,jdbc.queryForObject("SELECT COUNT(*) FROM candle",Integer.class));
         assertEquals("HISTORICAL_ONLY",jdbc.queryForObject("SELECT classification FROM market_data_stream_event WHERE symbol_sequence=2",String.class));
         assertEquals(100000,jdbc.queryForObject("SELECT observed_at FROM market_data_stream_lane",java.sql.Timestamp.class).toInstant().toEpochMilli());

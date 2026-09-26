@@ -26,13 +26,13 @@ public class CandleStore {
     private StreamPublisher streamPublisher;
     @org.springframework.beans.factory.annotation.Autowired(required=false)
     private io.micrometer.core.instrument.MeterRegistry meters;
-    private void timeTransaction() {
+    private void timeTransaction(String source) {
         if(meters==null || !org.springframework.transaction.support.TransactionSynchronizationManager.isSynchronizationActive())return;
         long started=System.nanoTime();
         org.springframework.transaction.support.TransactionSynchronizationManager.registerSynchronization(
             new org.springframework.transaction.support.TransactionSynchronization() {
                 @Override public void afterCompletion(int status) {
-                    meters.timer("fix132.collector.transaction","outcome",status==STATUS_COMMITTED?"committed":"rolled_back")
+                    meters.timer("fix132.collector.transaction","source",source,"outcome",status==STATUS_COMMITTED?"committed":"rolled_back")
                         .record(System.nanoTime()-started,java.util.concurrent.TimeUnit.NANOSECONDS);
                 }
             });
@@ -45,7 +45,7 @@ public class CandleStore {
 
     @Transactional
     public boolean persistWebsocket(JsonNode root) {
-        timeTransaction();
+        timeTransaction("websocket");
         JsonNode data = root.has("data") ? root.path("data") : root;
         JsonNode k = data.path("k");
         if (k.isMissingNode() || k.isNull()) {
@@ -72,7 +72,7 @@ public class CandleStore {
 
     @Transactional
     public void persistRest(String symbol, String interval, BinanceKline kline, String source, Instant observedAt) {
-        timeTransaction();
+        timeTransaction("rest");
         boolean closed = !kline.closeTime().isAfter(observedAt);
         var stream = streamPublisher == null ? null : streamPublisher.prepare(symbol,interval,kline.openTime(),kline.closeTime(),closed,
                 observedAt,kline.closePrice(),source,kline.toString());

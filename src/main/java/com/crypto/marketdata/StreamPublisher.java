@@ -16,7 +16,10 @@ import java.util.*;
 public class StreamPublisher {
     private final JdbcTemplate jdbc;
     private final boolean enabled;
-    private final String owner=UUID.randomUUID().toString();
+    @org.springframework.beans.factory.annotation.Autowired
+    private OwnershipGate gate;
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private io.micrometer.core.instrument.MeterRegistry meters;
     public StreamPublisher(JdbcTemplate jdbc, Environment env) {
         this.jdbc=jdbc; enabled=env.getProperty("market-data.stream.enabled",Boolean.class,false);
     }
@@ -24,7 +27,7 @@ public class StreamPublisher {
     public void validateSchema() {
         if(enabled)for(String table:List.of("market_data_stream_owner","market_data_stream_cursor","market_data_stream_version","market_data_stream_event","market_data_stream_lane"))
             jdbc.queryForObject("SELECT COUNT(*) FROM "+table+" WHERE 1=0",Long.class);
-        org.slf4j.LoggerFactory.getLogger(StreamPublisher.class).info("[FIX-132][SOURCE_CONFIGURATION] publicationEnabled={}, publisher={}",enabled,owner);
+        org.slf4j.LoggerFactory.getLogger(StreamPublisher.class).info("[FIX-132][SOURCE_CONFIGURATION] publicationEnabled={}",enabled);
     }
     public record Observation(String symbol,String interval,Instant open,Instant close,boolean closed,
         Instant observed,Instant received,BigDecimal price,String source,String hash,String classification) {
@@ -35,11 +38,29 @@ public class StreamPublisher {
         if(!enabled) return null;
         Instant received=Instant.now();
         if(!TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("FIX-132 publishing requires the candle transaction");
-        jdbc.update("INSERT IGNORE INTO market_data_stream_owner VALUES(1,?,TIMESTAMPADD(SECOND,30,CURRENT_TIMESTAMP(6)))",owner);
-        var lease=jdbc.queryForMap("SELECT owner_token, expires_at<CURRENT_TIMESTAMP(6) expired FROM market_data_stream_owner WHERE id=1 FOR UPDATE");
-        boolean expired=Boolean.TRUE.equals(lease.get("expired")) || "1".equals(String.valueOf(lease.get("expired")));
-        if(!owner.equals(lease.get("owner_token")) && !expired) throw new IllegalStateException("FIX-132 another collector owns publication");
-        jdbc.update("UPDATE market_data_stream_owner SET owner_token=?,expires_at=TIMESTAMPADD(SECOND,30,CURRENT_TIMESTAMP(6)) WHERE id=1",owner);
+        var permit=gate.currentPermit();
+        if(permit==null)throw new IllegalStateException("FIX-132 persistence requires pre-transaction admission");
+        long fenceStarted=System.nanoTime();
+        try {
+            var rows=jdbc.queryForList("SELECT owner_token FROM market_data_stream_owner WHERE id=1 FOR UPDATE");
+            // Evaluate expiry AFTER lock acquisition, not using statement-start time from before a wait.
+            boolean valid=!rows.isEmpty()&&Boolean.TRUE.equals(jdbc.queryForObject(
+                "SELECT expires_at>CURRENT_TIMESTAMP(6) FROM market_data_stream_owner WHERE id=1",Boolean.class));
+            if(rows.isEmpty()||!permit.token().equals(rows.getFirst().get("owner_token"))||!valid){
+                gate.lost("transactional fence rejected token/expiry");
+                throw new IllegalStateException("FIX-132 transactional ownership fence rejected write");
+            }
+        } catch(org.springframework.dao.DataAccessException failure) {
+            gate.uncertain("transactional ownership check failed");throw failure;
+        } finally {
+            if(meters!=null)meters.timer("fix132.persistence.fence","source",source.equals("LIVE_WEBSOCKET")?"websocket":"rest")
+                .record(System.nanoTime()-fenceStarted,java.util.concurrent.TimeUnit.NANOSECONDS);
+        }
+        long afterFence=System.nanoTime();
+        if(meters!=null)TransactionSynchronizationManager.registerSynchronization(new org.springframework.transaction.support.TransactionSynchronization(){
+            @Override public void afterCompletion(int status){meters.timer("fix132.persistence.after_fence","source",source.equals("LIVE_WEBSOCKET")?"websocket":"rest",
+                "outcome",status==STATUS_COMMITTED?"committed":"rolled_back").record(System.nanoTime()-afterFence,java.util.concurrent.TimeUnit.NANOSECONDS);}
+        });
         jdbc.update("INSERT IGNORE INTO market_data_stream_cursor(symbol) VALUES(?)",symbol);
         jdbc.queryForObject("SELECT last_sequence FROM market_data_stream_cursor WHERE symbol=? FOR UPDATE",Long.class,symbol);
         String hash=hash(payload);

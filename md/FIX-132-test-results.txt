@@ -1,12 +1,36 @@
-Actual Maven execution; Java 21, Maven 3.9.11, offline cache, Mockito startup javaagent. H2 database tests; no live MySQL/Binance acceptance.
+FIX-132 collector ownership correction — actual execution results
+Java 21.0.12.1; Maven 3.9.11; HikariCP 7.0.2; MySQL Connector/J 9.7.0.
+Unit command: mvn test -DargLine=-javaagent:<local-repository>/org/mockito/mockito-core/5.23.0/mockito-core-5.23.0.jar
+Integration command: mvn -Pfix132-mysql test (FIX132_TEST_MYSQL_URL set to isolated loopback fix132_test_ownership schema).
+MySQL Community Server 8.0.44 / InnoDB. No server deployment, Binance load soak or production dataset verification.
+Initial fixture failures and a physical-eviction cleanup failure were corrected before the successful runs below.
 
-[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.657 s -- in com.crypto.marketdata.CollectorWebSocketTransportTest
-[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.216 s -- in com.crypto.marketdata.BinanceWebSocketHandlerTest
-[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.008 s -- in com.crypto.marketdata.CollectorUtcConfigurationTest
-[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.056 s -- in com.crypto.marketdata.CollectorConnectionOwnerTest
-[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.475 s -- in com.crypto.marketdata.StreamPublisherTest
-[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.038 s -- in com.crypto.marketdata.GapRepairServiceTest
-[INFO] Tests run: 22, Failures: 0, Errors: 0, Skipped: 0
+UNIT/REGRESSION
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.248 s -- in com.crypto.marketdata.AdmittedCandleWriterTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.433 s -- in com.crypto.marketdata.GapRepairServiceTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.630 s -- in com.crypto.marketdata.OwnershipWiringTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.052 s -- in com.crypto.marketdata.OwnershipCoordinatorTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.082 s -- in com.crypto.marketdata.BinanceWebSocketHandlerTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.355 s -- in com.crypto.marketdata.StreamPublisherTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in com.crypto.marketdata.CollectorUtcConfigurationTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.170 s -- in com.crypto.marketdata.CollectorWebSocketTransportTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.049 s -- in com.crypto.marketdata.RecoveryCoordinatorTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.027 s -- in com.crypto.marketdata.CollectorIngestionHealthTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.034 s -- in com.crypto.marketdata.CollectorConnectionOwnerTest
+[INFO] Tests run: 36, Failures: 0, Errors: 0, Skipped: 0
 [INFO] BUILD SUCCESS
-[INFO] Total time:  4.193 s
-[INFO] Finished at: 2026-09-26T00:03:15+02:00
+[INFO] Total time:  5.136 s
+[INFO] Finished at: 2026-09-26T14:31:21+02:00
+
+REAL MYSQL/INNODB
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 4.802 s -- in com.crypto.marketdata.OwnershipMySqlIT
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+[INFO] Total time:  7.272 s
+[INFO] Finished at: 2026-09-26T14:32:24+02:00
+
+PACKAGED BUILD (mvn package; tests enabled)
+[INFO] Tests run: 36, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+[INFO] Total time:  4.013 s
+[INFO] Finished at: 2026-09-26T14:36:17+02:00

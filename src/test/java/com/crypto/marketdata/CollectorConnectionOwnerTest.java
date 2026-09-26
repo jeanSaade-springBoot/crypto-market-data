@@ -31,6 +31,23 @@ class CollectorConnectionOwnerTest {
         return session;
     }
 
+    @Test void waitingOwnershipPreventsHandshakeAndOldEpochCannotResume() throws Exception {
+        var gate=new OwnershipGate(true);var store=mock(CandleStore.class);
+        var handlers=new ArrayList<BinanceWebSocketHandler>();var sessions=new ArrayList<WebSocketSession>();
+        var owner=new CollectorConnectionOwner(new ObjectMapper(),store,(handler,uri)->{
+            handlers.add(handler);var socket=session("epoch-"+handlers.size());sessions.add(socket);
+            handler.afterConnectionEstablished(socket);return CompletableFuture.completedFuture(socket);
+        },Duration.ofSeconds(15));owner.ownershipGate(gate);
+        assertEquals(CollectorConnectionOwner.Outcome.DRAINING,owner.connect(URI_VALUE));assertTrue(handlers.isEmpty());
+        gate.acquired("token");assertEquals(CollectorConnectionOwner.Outcome.CONNECTED,owner.connect(URI_VALUE));
+        handlers.getFirst().handleTextMessage(sessions.getFirst(),MESSAGE);verify(store,times(1)).persistWebsocket(any());
+        gate.uncertain("renew failed");handlers.getFirst().handleTextMessage(sessions.getFirst(),MESSAGE);verify(store,times(1)).persistWebsocket(any());
+        owner.pause();assertTrue(owner.quiescent());gate.waiting();gate.acquired("token");
+        assertEquals(CollectorConnectionOwner.Outcome.CONNECTED,owner.connect(URI_VALUE));
+        handlers.getFirst().handleTextMessage(sessions.getFirst(),MESSAGE);verify(store,times(1)).persistWebsocket(any());
+        handlers.get(1).handleTextMessage(sessions.get(1),MESSAGE);verify(store,times(2)).persistWebsocket(any());owner.stop();
+    }
+
     @Test
     void timedOutAttemptRejectsLateEstablishmentAndCannotWrite() throws Exception {
         CandleStore store = mock(CandleStore.class);

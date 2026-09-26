@@ -22,6 +22,13 @@ public class GapRepairService {
         this.properties = properties;
     }
 
+    @org.springframework.beans.factory.annotation.Autowired
+    private AdmittedCandleWriter admittedWriter;
+
+    private void persist(String symbol,String interval,BinanceKline candle,String source,Instant observed) {
+        if(admittedWriter!=null)admittedWriter.persistRest(symbol,interval,candle,source,observed);
+        else store.persistRest(symbol,interval,candle,source,observed); // Standalone unit-test constructor.
+    }
     public void reconcile(String symbol, String interval) {
         Instant observedAt = Instant.now();
         Duration step = IntervalSupport.duration(interval);
@@ -90,7 +97,7 @@ public class GapRepairService {
                 if (row.openTime().isBefore(cursor)) continue;
                 if (!row.openTime().isBefore(gap.endExclusive())) return repaired;
                 if (row.closeTime().isAfter(observedAt)) return repaired;
-                store.persistRest(symbol, interval, row, "REST_INTERNAL_GAP_REPAIR", observedAt);
+                persist(symbol, interval, row, "REST_INTERNAL_GAP_REPAIR", observedAt);
                 repaired++;
                 lastAccepted = row.openTime();
             }
@@ -108,7 +115,7 @@ public class GapRepairService {
             if (row.closeTime().isAfter(observedAt)) {
                 continue;
             }
-            store.persistRest(symbol, interval, row, source, observedAt);
+            persist(symbol, interval, row, source, observedAt);
             count++;
         }
         return count;

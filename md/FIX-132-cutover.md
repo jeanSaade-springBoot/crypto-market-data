@@ -1,6 +1,6 @@
 # FIX-132 controlled cutover runbook
 
-Candidate only. No commands here have been run against your server. Keep LIVE disabled until the checks below pass. Do not reset an existing LIVE checkpoint as a restart procedure.
+Candidate only. No commands here have been run against your server. **First read FIX-132-ownership-correction.md. Ownership is acquired before ingestion; restart/uncertainty can still pause candle collection.** Keep LIVE disabled until the checks below pass. Do not reset an existing LIVE checkpoint as a restart procedure.
 
 ## 1. Schema and collector preparation
 
@@ -8,7 +8,7 @@ Back up both schemas. Verify MySQL versions, permissions, available space and mi
 
 Apply collector `md/sql/FIX-132-source-tables.sql` to **crypto_ai_v2** using its schema owner's migration process. It creates additive stream tables, including the observation lane. Collector does not take over another application's migration history. Existing market_data_candle_event claim fields remain untouched.
 
-Deploy collector with MARKET_DATA_STREAM_ENABLED=false first and verify ownership/reconnect behavior. Arrange exactly one active candle writer before enabling its feed. Every writer must use the enabled publication protocol; it cannot fence old binaries or feed-disabled writers. Then enable MARKET_DATA_STREAM_ENABLED=true and measure source transaction time, event volume, disk growth and existing-consumer latency. Validate timeout/late-handshake/drain cases and historical repair behavior on MySQL. No feed-retention deletion is provided: agree storage/retention that protects every consumer and the required Replay evidence before activation.
+Deploy collector with MARKET_DATA_STREAM_ENABLED=false first and verify ownership/reconnect behavior. Arrange exactly one active candle writer before enabling its feed. Every writer must use the enabled publication protocol; it cannot fence old binaries or feed-disabled writers. Only after the isolated ownership tests and deployment checks pass, enable MARKET_DATA_STREAM_ENABLED=true under the agreed validation window and measure source transaction time, event volume, disk growth and existing-consumer latency. Validate timeout/late-handshake/drain cases and historical repair behavior on MySQL. No feed-retention deletion is provided: agree storage/retention that protects every consumer and the required Replay evidence before activation.
 
 ## 2. Trader observation
 

@@ -29,6 +29,8 @@ final class CollectorConnectionOwner {
     private boolean connecting;
     private boolean stopped;
     private long generation;
+    private OwnershipGate gate;
+    void ownershipGate(OwnershipGate gate){this.gate=gate;}
 
     CollectorConnectionOwner(ObjectMapper mapper, CandleStore store, Connector connector, Duration timeout) {
         this.mapper = mapper;
@@ -41,6 +43,7 @@ final class CollectorConnectionOwner {
         BinanceWebSocketHandler previous;
         synchronized (this) {
             if (stopped) return Outcome.STOPPED;
+            if (gate!=null&&!gate.admitting())return Outcome.DRAINING;
             if (connecting) return Outcome.DRAINING;
             connecting = true;
             previous = current;
@@ -57,6 +60,7 @@ final class CollectorConnectionOwner {
                 return Outcome.DRAINING;
             }
             next = new BinanceWebSocketHandler(mapper, store, ++generation);
+            if(gate!=null)next.ownershipGate(gate,gate.epoch());
             current = next; // register ownership BEFORE the provider can establish
         }
         CompletableFuture<WebSocketSession> future = null;
@@ -87,6 +91,13 @@ final class CollectorConnectionOwner {
     }
 
     synchronized boolean isConnected() { return !stopped && current != null && current.isConnected(); }
+
+    void pause() {
+        BinanceWebSocketHandler old;CompletableFuture<WebSocketSession> pending;
+        synchronized(this){old=current;pending=attempt;}
+        if(old!=null)old.close();if(pending!=null)pending.cancel(true);
+    }
+    synchronized boolean quiescent(){return !connecting&&(current==null||(current.isDrained()&&current.isTransportClosed()));}
 
     void stop() {
         BinanceWebSocketHandler old;

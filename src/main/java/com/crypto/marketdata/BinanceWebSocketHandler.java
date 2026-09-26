@@ -22,6 +22,8 @@ public class BinanceWebSocketHandler extends TextWebSocketHandler {
     private WebSocketSession session;
     private boolean revoked;
     private int inFlight;
+    private OwnershipGate gate;private long ownershipEpoch;
+    void ownershipGate(OwnershipGate value,long epoch){gate=value;ownershipEpoch=epoch;}
 
     public BinanceWebSocketHandler(ObjectMapper objectMapper, CandleStore candleStore) {
         this(objectMapper, candleStore, 0);
@@ -41,7 +43,7 @@ public class BinanceWebSocketHandler extends TextWebSocketHandler {
             // A timeout/shutdown may have won before the provider reports success.
             // A duplicate callback for our own session is harmless; a distinct extra
             // session is closed without taking ownership away from the real session.
-            reject = revoked || (session != null && session != established);
+            reject = (gate!=null&&(!gate.admitting()||gate.epoch()!=ownershipEpoch)) || revoked || (session != null && session != established);
             newlyEstablished = !reject && session == null;
             if (!reject) session = established;
         }
@@ -62,7 +64,8 @@ public class BinanceWebSocketHandler extends TextWebSocketHandler {
             inFlight++;
         }
         long started = System.nanoTime();
-        try {
+        try (var permit=gate==null?null:gate.admit(ownershipEpoch)) {
+            if(gate!=null&&permit==null)return;
             JsonNode root = objectMapper.readTree(message.getPayload());
             JsonNode data = root.has("data") ? root.path("data") : root;
             JsonNode k = data.path("k");
@@ -73,6 +76,8 @@ public class BinanceWebSocketHandler extends TextWebSocketHandler {
                         java.time.Instant.ofEpochMilli(k.path("t").asLong()));
             }
         } catch (Exception exception) {
+            if(gate!=null&&(exception instanceof org.springframework.dao.DataAccessException || exception instanceof org.springframework.transaction.TransactionException))
+                gate.uncertain("WebSocket persistence database failure");
             log.error("[FIX-132][CANDLE_PERSIST_FAILED] generation={}; candle may be missing", generation, exception);
         } finally {
             synchronized (this) {
