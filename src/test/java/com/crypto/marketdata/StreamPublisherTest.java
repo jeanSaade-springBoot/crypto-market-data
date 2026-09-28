@@ -25,7 +25,7 @@ class StreamPublisherTest {
             taker_buy_quote_volume DECIMAL(38,12),closed BOOLEAN,created_at TIMESTAMP,updated_at TIMESTAMP,UNIQUE(symbol,interval_code,open_time))
             """);
         jdbc.execute("CREATE TABLE market_data_candle_event(symbol VARCHAR(30),interval_code VARCHAR(10),candle_open_time TIMESTAMP,candle_close_time TIMESTAMP,source VARCHAR(30),observed_at TIMESTAMP,created_at TIMESTAMP,UNIQUE(symbol,interval_code,candle_open_time))");
-        String ddl=Files.readString(Path.of("md/sql/FIX-132-source-tables.sql")).replaceAll("(?m)^--.*$","");
+        String ddl=(Files.readString(Path.of("md/sql/FIX-132-source-tables.sql"))+Files.readString(Path.of("md/sql/FIX-133-websocket-version.sql"))).replaceAll("(?m)^--.*$","");
         for(String statement:ddl.split(";"))if(!statement.isBlank())jdbc.execute(statement);
         publisher=new StreamPublisher(jdbc,new MockEnvironment().withProperty("market-data.stream.enabled","true"));
         gate=new OwnershipGate(true);gate.acquired(token);
@@ -38,7 +38,7 @@ class StreamPublisherTest {
         try(var permit=gate.admit()){tx.executeWithoutResult(status->store.persistWebsocket(json));}
     }
     @Test void offRequiresNoFeedTables() throws Exception {
-        for(String table:new String[]{"market_data_stream_event","market_data_stream_version","market_data_stream_cursor","market_data_stream_owner","market_data_stream_lane"})jdbc.execute("DROP TABLE "+table);
+        for(String table:new String[]{"market_data_stream_event","market_data_stream_version","market_data_stream_cursor","market_data_stream_owner","market_data_stream_lane","market_data_stream_ws_version"})jdbc.execute("DROP TABLE "+table);
         ReflectionTestUtils.setField(store,"streamPublisher",new StreamPublisher(jdbc,new MockEnvironment()));
         write(2000,false,"1");assertEquals(1,jdbc.queryForObject("SELECT COUNT(*) FROM candle",Integer.class));
     }

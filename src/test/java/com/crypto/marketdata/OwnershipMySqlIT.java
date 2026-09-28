@@ -97,7 +97,7 @@ class OwnershipMySqlIT {
     }
     @Test void enabledPrivatePoolPreservesBootDatasourceAndSessionLimits()throws Exception{
         try(var c=connection();var statement=c.createStatement()){
-            String ddl=java.nio.file.Files.readString(java.nio.file.Path.of("md/sql/FIX-132-source-tables.sql")).replaceAll("(?m)^--.*$","");
+            String ddl=(java.nio.file.Files.readString(java.nio.file.Path.of("md/sql/FIX-132-source-tables.sql"))+java.nio.file.Files.readString(java.nio.file.Path.of("md/sql/FIX-133-websocket-version.sql"))).replaceAll("(?m)^--.*$","");
             for(String sql:ddl.split(";"))if(!sql.isBlank())statement.execute(sql);
         }
         new org.springframework.boot.test.context.runner.ApplicationContextRunner()

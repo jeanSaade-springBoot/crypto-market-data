@@ -25,9 +25,10 @@ public class StreamPublisher {
     }
     @jakarta.annotation.PostConstruct
     public void validateSchema() {
-        if(enabled)for(String table:List.of("market_data_stream_owner","market_data_stream_cursor","market_data_stream_version","market_data_stream_event","market_data_stream_lane"))
+        if(enabled)for(String table:List.of("market_data_stream_owner","market_data_stream_cursor","market_data_stream_version","market_data_stream_event","market_data_stream_lane","market_data_stream_ws_version"))
             jdbc.queryForObject("SELECT COUNT(*) FROM "+table+" WHERE 1=0",Long.class);
         org.slf4j.LoggerFactory.getLogger(StreamPublisher.class).info("[FIX-132][SOURCE_CONFIGURATION] publicationEnabled={}",enabled);
+        org.slf4j.LoggerFactory.getLogger(StreamPublisher.class).info("[FIX-133][ORDERING_CONFIGURATION] isolatedWebsocketWatermark=true, publicationEnabled={}",enabled);
     }
     public record Observation(String symbol,String interval,Instant open,Instant close,boolean closed,
         Instant observed,Instant received,BigDecimal price,String source,String hash,String classification) {
@@ -65,7 +66,11 @@ public class StreamPublisher {
         jdbc.queryForObject("SELECT last_sequence FROM market_data_stream_cursor WHERE symbol=? FOR UPDATE",Long.class,symbol);
         String hash=hash(payload);
         var versions=jdbc.queryForList("SELECT observed_at,closed,payload_hash FROM market_data_stream_version WHERE symbol=? AND interval_code=? AND open_time=? FOR UPDATE",symbol,interval,Timestamp.from(open));
-        String classification="LIVE_WEBSOCKET".equals(source)?"LIVE":"HISTORICAL_ONLY";
+        boolean websocket="LIVE_WEBSOCKET".equals(source);
+        // FIX-133: REST observed_at is recovery wall time, never Binance ordering
+        // authority. Canonical closed-state and the WS watermark are separate.
+        var wsVersions=websocket ? jdbc.queryForList("SELECT observed_at,closed,payload_hash FROM market_data_stream_ws_version WHERE symbol=? AND interval_code=? AND open_time=? FOR UPDATE",symbol,interval,Timestamp.from(open)) : List.<Map<String,Object>>of();
+        String classification=websocket?"LIVE":"HISTORICAL_ONLY";
         // First feed-enabled update may encounter pre-existing closed history.
         // Never let a forming WS update reopen it merely because the sidecar is new.
         if(versions.isEmpty() && !closed) {
@@ -78,8 +83,8 @@ public class StreamPublisher {
         }
         if("LIVE".equals(classification)) {
             if(observed==null) classification="UNKNOWN_TIME";
-            else if(!versions.isEmpty()) {
-                var old=versions.getFirst();
+            else if(!wsVersions.isEmpty()) {
+                var old=wsVersions.getFirst();
                 Instant oldTime=old.get("observed_at")==null?null:((Timestamp)old.get("observed_at")).toInstant();
                 boolean oldClosed=Boolean.TRUE.equals(old.get("closed")) || "1".equals(String.valueOf(old.get("closed")));
                 if(hash.equals(old.get("payload_hash")) && observed.equals(oldTime)) classification="DUPLICATE";
@@ -91,7 +96,13 @@ public class StreamPublisher {
             // different candle must not become a new live close simply because its
             // own per-candle version sidecar is absent. Preserve its candle as history.
             var lane=jdbc.queryForList("SELECT observed_at,open_time FROM market_data_stream_lane WHERE symbol=? AND interval_code=? FOR UPDATE",symbol,interval);
-            if(!lane.isEmpty() && (observed.isBefore(((Timestamp)lane.getFirst().get("observed_at")).toInstant())
+            // The pre-upgrade lane has known WS provenance; the version does not.
+            // With no new sidecar yet, never re-authorize an at/below-watermark
+            // event for the SAME candle. A new event can establish the sidecar.
+            if(wsVersions.isEmpty() && !lane.isEmpty()
+                    && open.equals(((Timestamp)lane.getFirst().get("open_time")).toInstant())
+                    && !observed.isAfter(((Timestamp)lane.getFirst().get("observed_at")).toInstant())) classification="OUT_OF_ORDER";
+            else if(!lane.isEmpty() && (observed.isBefore(((Timestamp)lane.getFirst().get("observed_at")).toInstant())
                     || open.isBefore(((Timestamp)lane.getFirst().get("open_time")).toInstant()))) classification="HISTORICAL_ONLY";
             else jdbc.update("INSERT INTO market_data_stream_lane(symbol,interval_code,observed_at,open_time) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE observed_at=VALUES(observed_at),open_time=VALUES(open_time)",symbol,interval,Timestamp.from(observed),Timestamp.from(open));
         }
@@ -100,6 +111,21 @@ public class StreamPublisher {
             INSERT INTO market_data_stream_version(symbol,interval_code,open_time,observed_at,closed,payload_hash) VALUES(?,?,?,?,?,?)
             ON DUPLICATE KEY UPDATE observed_at=VALUES(observed_at),closed=VALUES(closed),payload_hash=VALUES(payload_hash)
             """,symbol,interval,Timestamp.from(open),observed==null?null:Timestamp.from(observed),closed,hash);
+        if(result.accepted() && websocket) jdbc.update("""
+            INSERT INTO market_data_stream_ws_version(symbol,interval_code,open_time,observed_at,closed,payload_hash) VALUES(?,?,?,?,?,?)
+            ON DUPLICATE KEY UPDATE observed_at=VALUES(observed_at),closed=VALUES(closed),payload_hash=VALUES(payload_hash)
+            """,symbol,interval,Timestamp.from(open),Timestamp.from(observed),closed,hash);
+        // Only committed classifications are logged; rolled-back attempts are
+        // not delivery. Forming ticks use metrics to avoid per-tick log volume.
+        TransactionSynchronizationManager.registerSynchronization(new org.springframework.transaction.support.TransactionSynchronization(){
+            @Override public void afterCommit() {
+                if(meters!=null)meters.counter("fix133.stream.classification","source",websocket?"websocket":"rest","classification",result.classification()).increment();
+                if(websocket && closed && (!"LIVE".equals(result.classification()) || wsVersions.isEmpty() && !versions.isEmpty()))
+                    org.slf4j.LoggerFactory.getLogger(StreamPublisher.class).info(
+                        "[FIX-133][WS_CLOSE_CLASSIFICATION] symbol={}, interval={}, open={}, observed={}, classification={}, priorWsVersion={}, priorCanonicalVersion={}",
+                        symbol,interval,open,observed,result.classification(),!wsVersions.isEmpty(),!versions.isEmpty());
+            }
+        });
         return result;
     }
     public void publish(Observation e) {

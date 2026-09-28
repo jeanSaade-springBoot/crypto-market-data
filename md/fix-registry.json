@@ -1,0 +1,12 @@
+{
+  "entries": [
+    {
+      "id": "FIX-133",
+      "title": "Collector historical/live timestamp provenance",
+      "status": "IMPLEMENTED_REVIEW_CANDIDATE",
+      "implementation": "StreamPublisher",
+      "document": "md/FIX-133.md",
+      "verification": "11 isolated MySQL scenarios passed; full Jenkins build pending"
+    }
+  ]
+}
