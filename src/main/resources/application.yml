@@ -4,9 +4,9 @@ spring:
   datasource:
     # FIX-139 collector intentionally writes to the same canonical candle schema.
     # Schema migrations remain owned by crypto-ai-next Flyway; this service never runs Flyway.
-    url: ${DB_URL:jdbc:mysql://169.58.108.119:3307/crypto_ai_v2?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC}
-    username: ${DB_USERNAME:jean}
-    password: ${DB_PASSWORD:123456}
+    url: ${DB_URL:jdbc:mysql://localhost:3307/crypto_ai_v2?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC}
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:root}
     hikari:
       maximum-pool-size: ${DB_POOL_MAX:6}
       minimum-idle: ${DB_POOL_MIN:1}
