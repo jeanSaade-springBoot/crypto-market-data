@@ -1,505 +1,190 @@
 pipeline {
-
     agent any
-
-    tools {
-        maven 'Maven'
-    }
-
+    tools { maven 'Maven' }
     environment {
         DEPLOY_DIR = 'C:\\apps\\crypto-market-data'
-
-        // Change this if your crypto-market-data application uses another port.
         APP_PORT = '8090'
-
         APP_JAR = 'crypto-market-data.jar'
-        APP_LOG = 'crypto-market-data.log'
-        APP_ERROR_LOG = 'crypto-market-data-error.log'
         BACKUP_JAR = 'crypto-market-data-backup.jar'
     }
-
     options {
-        buildDiscarder(logRotator(
-            numToKeepStr: '10',
-            artifactNumToKeepStr: '10'
-        ))
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10', artifactNumToKeepStr: '10'))
     }
     stages {
-
-        stage('Checkout') {
-            steps {
-                checkout scm
-            }
-        }
-
-        stage('Build') {
-            steps {
-                bat '''
-                @echo off
-
-                echo Building Crypto Market Data...
-
-                call mvn clean package -DskipTests
-
-                if errorlevel 1 (
-                    echo Maven build failed.
-                    exit /b 1
-                )
-
-                echo Maven build completed successfully.
-                '''
-            }
-        }
-
-        stage('Test') {
-            steps {
-                bat '''
-                @echo off
-
-                echo Running Crypto Market Data tests...
-
-                call mvn test
-
-                if errorlevel 1 (
-                    echo Maven tests failed.
-                    exit /b 1
-                )
-
-                echo Maven tests completed successfully.
-                '''
-            }
-        }
-
-        stage('Stop old application') {
-            steps {
-                bat '''
-                @echo off
-                setlocal EnableDelayedExpansion
-
-                echo Checking for an existing Crypto Market Data process on port %APP_PORT%...
-
-                set "FOUND_PROCESS=false"
-
-                for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%APP_PORT%" ^| findstr "LISTENING"') do (
-                    set "FOUND_PROCESS=true"
-
-                    echo Stopping process PID %%a...
-
-                    taskkill /PID %%a /F >nul 2>&1
-                )
-
-                if "!FOUND_PROCESS!"=="false" (
-                    echo No existing process was listening on port %APP_PORT%.
-                )
-
-                endlocal
-                exit /b 0
-                '''
-            }
-        }
-
-        stage('Wait for port release') {
+        stage('Checkout') { steps { checkout scm } }
+        stage('Build') { steps { bat 'call mvn clean package -DskipTests' } }
+        stage('Test') { steps { bat 'call mvn test' } }
+        stage('Deploy through WinSW') {
             steps {
                 powershell '''
-                    Write-Host "Waiting for port $env:APP_PORT to be released..."
+                    $ErrorActionPreference = 'Stop'
+                    $serviceName = 'CryptoMarketData'
+                    $jar = Join-Path $env:DEPLOY_DIR $env:APP_JAR
+                    $backup = Join-Path $env:DEPLOY_DIR $env:BACKUP_JAR
+                    $serviceDir = Join-Path $env:DEPLOY_DIR 'service'
+                    $wrapper = Join-Path $serviceDir 'CryptoMarketDataService.exe'
+                    $xmlPath = Join-Path $serviceDir 'CryptoMarketDataService.xml'
+                    $stopScript = Join-Path $serviceDir 'jenkins-stop.ps1'
+                    $startScript = Join-Path $serviceDir 'jenkins-start.ps1'
+                    $serviceKey = "HKLM:/SYSTEM/CurrentControlSet/Services/$serviceName"
+                    $port = [int]$env:APP_PORT
 
-                    $maxAttempts = 12
-                    $released = $false
-
-                    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-
-                        $listener = Get-NetTCPConnection `
-                            -LocalPort ([int]$env:APP_PORT) `
-                            -State Listen `
-                            -ErrorAction SilentlyContinue
-
-                        if (-not $listener) {
-
-                            Write-Host "Port $env:APP_PORT is available."
-
-                            $released = $true
-                            break
+                    function Service { Get-CimInstance Win32_Service -Filter "Name='$serviceName'" }
+                    function Snapshot {
+                        [pscustomobject]@{
+                            Service = (Service)
+                            Processes = @(Get-CimInstance Win32_Process)
+                            Owners = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
+                                Select-Object -ExpandProperty OwningProcess -Unique)
                         }
-
-                        Write-Host "Port is still in use. Attempt $attempt of $maxAttempts..."
-
-                        Start-Sleep -Seconds 2
+                    }
+                    function Collectors($snapshot) {
+                        @($snapshot.Processes | Where-Object {
+                            $_.Name -match '^java(w)?[.]exe$' -and
+                            $_.CommandLine -match '(?i)crypto-market-data[.]jar'
+                        })
+                    }
+                    function Assert-Owned($snapshot) {
+                        $apps = @(Collectors $snapshot)
+                        if ($snapshot.Service.State -ne 'Running' -or $snapshot.Service.ProcessId -eq 0) {
+                            throw 'Collector service is not running.'
+                        }
+                        if ($apps.Count -ne 1 -or $snapshot.Owners.Count -ne 1) {
+                            throw 'Expected exactly one collector JVM and one listener owner.'
+                        }
+                        $app = $apps[0]
+                        if ($app.ParentProcessId -ne $snapshot.Service.ProcessId -or
+                            $app.ProcessId -ne $snapshot.Owners[0] -or
+                            $app.ExecutablePath -ine $java -or
+                            $app.CommandLine -notmatch [regex]::Escape($jar)) {
+                            throw 'Foreign collector or listener; manual ownership recovery required.'
+                        }
+                        $parent = @($snapshot.Processes | Where-Object ProcessId -eq $snapshot.Service.ProcessId)
+                        if ($parent.Count -ne 1 -or $parent[0].ExecutablePath -ine $wrapper -or
+                            $parent[0].CreationDate -gt $app.CreationDate) {
+                            throw 'WinSW process ancestry is invalid.'
+                        }
+                    }
+                    function Assert-Stopped($snapshot) {
+                        if ($snapshot.Service.State -ne 'Stopped' -or $snapshot.Service.StartMode -ne 'Disabled' -or
+                            @(Collectors $snapshot).Count -ne 0 -or $snapshot.Owners.Count -ne 0) {
+                            throw 'Stopped/disabled service, absent collector JVM and free port are required.'
+                        }
+                    }
+                    function Assert-Hash($path, $expected) {
+                        if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $expected) {
+                            throw "Artifact checksum mismatch: $path"
+                        }
+                    }
+                    function Assert-ApprovedRelease($path) {
+                        $approved = '856F605363557623AF8C54BB18D4D06C84152318074CA4368F0BAF8DB755C5A0'
+                        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                            throw 'Approved release artifact is missing.'
+                        }
+                        Assert-Hash $path $approved
+                    }
+                    function Invoke-ServiceScript($path) {
+                        & powershell.exe -NoProfile -NonInteractive -File $path
+                        if ($LASTEXITCODE -ne 0) { throw "Service script failed: $path" }
+                    }
+                    function Fence-And-Stop {
+                        Set-Service -Name $serviceName -StartupType Disabled
+                        Invoke-ServiceScript $stopScript
+                        Assert-Stopped (Snapshot)
+                    }
+                    function Restore-Startup {
+                        $mode = if ($wasDelayed) { 'delayed-auto' } else { 'auto' }
+                        & sc.exe config $serviceName start= $mode
+                        if ($LASTEXITCODE -ne 0) { throw 'Cannot restore service startup mode.' }
+                    }
+                    function Assert-Healthy($hash) {
+                        Assert-Owned (Snapshot)
+                        Assert-Hash $jar $hash
+                        $health = Invoke-RestMethod -Uri "http://localhost:$port/actuator/health/readiness" -TimeoutSec 5
+                        if ($health.status -ne 'UP') { throw 'Collector ingestion readiness is not UP.' }
+                        Assert-Owned (Snapshot)
                     }
 
-                    if (-not $released) {
-
-                        Write-Error "Port $env:APP_PORT could not be released."
-
-                        exit 1
+                    # No mutation until prerequisites and existing ownership pass.
+                    foreach ($path in @($jar, $wrapper, $xmlPath, $stopScript, $startScript)) {
+                        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing prerequisite: $path" }
                     }
-                '''
-            }
-        }
-
-        stage('Prepare deployment folder') {
-            steps {
-                bat '''
-                @echo off
-
-                if not exist "%DEPLOY_DIR%" (
-
-                    echo Creating deployment directory...
-
-                    mkdir "%DEPLOY_DIR%"
-                )
-
-                if errorlevel 1 (
-
-                    echo Failed to create deployment directory.
-
-                    exit /b 1
-                )
-
-                if exist "%DEPLOY_DIR%\\%APP_JAR%" (
-
-                    echo Creating backup of the current JAR...
-
-                    copy /Y ^
-                        "%DEPLOY_DIR%\\%APP_JAR%" ^
-                        "%DEPLOY_DIR%\\%BACKUP_JAR%" >nul
-
-                    if errorlevel 1 (
-
-                        echo Failed to create backup.
-
-                        exit /b 1
-                    )
-
-                    echo Backup created successfully.
-
-                ) else (
-
-                    echo No existing JAR was found. Backup skipped.
-                )
-                '''
-            }
-        }
-
-        stage('Deploy new JAR') {
-            steps {
-                bat '''
-                @echo off
-                setlocal EnableDelayedExpansion
-
-                set "FOUND_JAR="
-
-                for %%f in (target\\*.jar) do (
-                    set "FOUND_JAR=%%f"
-                )
-
-                if not defined FOUND_JAR (
-
-                    echo No executable JAR was found in the target folder.
-
-                    exit /b 1
-                )
-
-                echo Deploying !FOUND_JAR!...
-
-                copy /Y ^
-                    "!FOUND_JAR!" ^
-                    "%DEPLOY_DIR%\\%APP_JAR%" >nul
-
-                if errorlevel 1 (
-
-                    echo Failed to copy the application JAR.
-
-                    exit /b 1
-                )
-
-                echo New JAR deployed successfully.
-
-                endlocal
-                '''
-            }
-        }
-
-        stage('Start application') {
-            steps {
-                bat '''
-                @echo off
-
-                cd /d "%DEPLOY_DIR%"
-
-                if exist "%APP_LOG%" (
-                    del /Q "%APP_LOG%"
-                )
-
-                if exist "%APP_ERROR_LOG%" (
-                    del /Q "%APP_ERROR_LOG%"
-                )
-
-                echo Starting Crypto Market Data on port %APP_PORT%...
-
-                set JENKINS_NODE_COOKIE=crypto-market-data-dont-kill
-
-                start "Crypto Market Data" /B cmd /c ^
-                    javaw -jar "%APP_JAR%" ^
-                    --server.port=%APP_PORT% ^
-                    1^> "%APP_LOG%" ^
-                    2^> "%APP_ERROR_LOG%"
-
-                echo Startup command executed.
-                '''
-            }
-        }
-
-        stage('Verify port') {
-            steps {
-                powershell '''
-                    Write-Host "Checking port $env:APP_PORT..."
-
-                    $maxAttempts = 18
-                    $delaySeconds = 5
-                    $listening = $false
-
-                    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-
-                        $listener = Get-NetTCPConnection `
-                            -LocalPort ([int]$env:APP_PORT) `
-                            -State Listen `
-                            -ErrorAction SilentlyContinue
-
-                        if ($listener) {
-
-                            Write-Host "Crypto Market Data is listening on port $env:APP_PORT."
-                            Write-Host "PID: $($listener.OwningProcess)"
-
-                            $listening = $true
-                            break
-                        }
-
-                        Write-Host "Port check attempt $attempt of $maxAttempts failed."
-
-                        Start-Sleep -Seconds $delaySeconds
+                    [xml]$config = Get-Content -LiteralPath $xmlPath -Raw
+                    $java = [Environment]::ExpandEnvironmentVariables([string]$config.service.executable)
+                    if ([string]$config.service.workingdirectory -ine $env:DEPLOY_DIR -or
+                        [string]$config.service.arguments -notmatch [regex]::Escape($jar)) {
+                        throw 'Installed WinSW application path contract differs.'
                     }
-
-                    if (-not $listening) {
-
-                        Write-Host ""
-                        Write-Host "Crypto Market Data did not start successfully."
-                        Write-Host ""
-
-                        Write-Host "Application output:"
-                        Write-Host "----------------------------------------"
-
-                        $logPath = Join-Path $env:DEPLOY_DIR $env:APP_LOG
-                        $errorLogPath = Join-Path $env:DEPLOY_DIR $env:APP_ERROR_LOG
-
-                        if (Test-Path $logPath) {
-
-                            Get-Content $logPath
-
-                        } else {
-
-                            Write-Host "Output log not found: $logPath"
+                    $initial = Snapshot
+                    if ($initial.Service.PathName.Trim('"') -ine $wrapper -or $initial.Service.StartMode -ne 'Auto') {
+                        throw 'Unexpected service installation or startup mode.'
+                    }
+                    Assert-Owned $initial
+                    $wasDelayed = (Get-ItemProperty -LiteralPath $serviceKey -Name DelayedAutoStart -ErrorAction SilentlyContinue).DelayedAutoStart -eq 1
+                    $candidates = @(Get-ChildItem -LiteralPath 'target' -Filter '*.jar' -File)
+                    if ($candidates.Count -ne 1) { throw 'Expected exactly one built executable JAR.' }
+                    $candidate = $candidates[0].FullName
+                    Assert-ApprovedRelease $candidate
+                    Add-Type -AssemblyName System.IO.Compression.FileSystem
+                    $archive = [IO.Compression.ZipFile]::OpenRead($candidate)
+                    try {
+                        if (-not $archive.GetEntry('BOOT-INF/classes/com/crypto/marketdata/CryptoMarketDataApplication.class')) {
+                            throw 'Candidate is not the executable collector artifact.'
                         }
-
-                        Write-Host ""
-                        Write-Host "Application errors:"
-                        Write-Host "----------------------------------------"
-
-                        if (Test-Path $errorLogPath) {
-
-                            Get-Content $errorLogPath
-
-                        } else {
-
-                            Write-Host "Error log not found: $errorLogPath"
+                    } finally { $archive.Dispose() }
+                    $newHash = (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash
+                    $oldHash = (Get-FileHash -LiteralPath $jar -Algorithm SHA256).Hash
+                    $xmlHash = (Get-FileHash -LiteralPath $xmlPath -Algorithm SHA256).Hash
+                    $recoveryBefore = @( & sc.exe qfailure $serviceName ) -join "`n"
+                    if ($LASTEXITCODE -ne 0) { throw 'Cannot record service recovery settings.' }
+                    Write-Host "CandidateSHA256=$newHash PreviousSHA256=$oldHash"
+                    $fenced = $false
+                    try {
+                        Assert-Owned (Snapshot)
+                        Assert-ApprovedRelease $candidate
+                        # Set before the mutation so any partial fencing failure is retained for review.
+                        $fenced = $true
+                        Fence-And-Stop
+                        Assert-Hash $jar $oldHash
+                        $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ')
+                        $immutableBackup = "$backup.$stamp"
+                        if (Test-Path -LiteralPath $immutableBackup) { throw 'Backup already exists.' }
+                        Copy-Item -LiteralPath $jar -Destination $immutableBackup
+                        Assert-Hash $immutableBackup $oldHash
+                        Copy-Item -LiteralPath $jar -Destination $backup -Force
+                        Assert-Hash $backup $oldHash
+                        Assert-Stopped (Snapshot)
+                        Assert-Hash $candidate $newHash
+                        Copy-Item -LiteralPath $candidate -Destination $jar -Force
+                        Assert-Hash $jar $newHash
+                        Assert-Hash $xmlPath $xmlHash
+                        Restore-Startup
+                        Invoke-ServiceScript $startScript
+                        Assert-Healthy $newHash
+                        Start-Sleep -Seconds 10
+                        Assert-Healthy $newHash
+                        $recoveryAfter = @( & sc.exe qfailure $serviceName ) -join "`n"
+                        if ($LASTEXITCODE -ne 0 -or $recoveryAfter -cne $recoveryBefore) {
+                            throw 'Automatic service recovery settings changed.'
                         }
-
-                        Write-Host "----------------------------------------"
-
-                        exit 1
+                        Write-Host "WinSW deployment verified; SHA256=$newHash; rollback=$immutableBackup"
+                    } catch {
+                        if ($fenced) {
+                            # Never replace a JAR or kill a port owner during failure recovery.
+                            # Disable retry startup, request SCM stop only, and report if drain fails.
+                            try { Fence-And-Stop } catch { Write-Warning "Stop/fence unconfirmed: $($_.Exception.Message)" }
+                            Write-Warning 'RECOVERY_REQUIRED: service fenced; retain artifacts/logs; separately approve rollback.'
+                        }
+                        throw
                     }
                 '''
             }
         }
-
-        stage('Confirm process remains running') {
-            steps {
-                powershell '''
-                    Write-Host "Confirming that Crypto Market Data remains running..."
-
-                    Start-Sleep -Seconds 10
-
-                    $listener = Get-NetTCPConnection `
-                        -LocalPort ([int]$env:APP_PORT) `
-                        -State Listen `
-                        -ErrorAction SilentlyContinue
-
-                    if (-not $listener) {
-
-                        Write-Host "Crypto Market Data stopped after deployment."
-
-                        $logPath = Join-Path $env:DEPLOY_DIR $env:APP_LOG
-                        $errorLogPath = Join-Path $env:DEPLOY_DIR $env:APP_ERROR_LOG
-
-                        Write-Host ""
-                        Write-Host "Application output:"
-
-                        if (Test-Path $logPath) {
-                            Get-Content $logPath
-                        }
-
-                        Write-Host ""
-                        Write-Host "Application errors:"
-
-                        if (Test-Path $errorLogPath) {
-                            Get-Content $errorLogPath
-                        }
-
-                        exit 1
-                    }
-
-                    Write-Host "Crypto Market Data is still running."
-                    Write-Host "PID: $($listener.OwningProcess)"
-                '''
-            }
-        }
-
     }
-
     post {
-
-        success {
-
-            echo 'Crypto Market Data was built, tested, deployed, started, and verified successfully.'
-
-            echo "Local URL: http://localhost:${APP_PORT}"
-
-            echo "External URL: http://169.58.108.119:${APP_PORT}"
-
-            echo "Application log: ${DEPLOY_DIR}\\${APP_LOG}"
-
-            echo "Error log: ${DEPLOY_DIR}\\${APP_ERROR_LOG}"
-        }
-
-        failure {
-
-            echo 'Crypto Market Data deployment failed. Attempting rollback...'
-
-            powershell '''
-
-                $deployDir = $env:DEPLOY_DIR
-
-                $appJar = Join-Path $deployDir $env:APP_JAR
-                $backupJar = Join-Path $deployDir $env:BACKUP_JAR
-
-                $logPath = Join-Path $deployDir $env:APP_LOG
-                $errorLogPath = Join-Path $deployDir $env:APP_ERROR_LOG
-
-                $listeners = Get-NetTCPConnection `
-                    -LocalPort ([int]$env:APP_PORT) `
-                    -State Listen `
-                    -ErrorAction SilentlyContinue
-
-                foreach ($listener in $listeners) {
-
-                    Write-Host "Stopping failed deployment process PID $($listener.OwningProcess)..."
-
-                    Stop-Process `
-                        -Id $listener.OwningProcess `
-                        -Force `
-                        -ErrorAction SilentlyContinue
-                }
-
-                Start-Sleep -Seconds 3
-
-                if (-not (Test-Path $backupJar)) {
-
-                    Write-Host "No backup JAR exists. Automatic rollback is unavailable."
-
-                    exit 0
-                }
-
-                Write-Host "Restoring backup JAR..."
-
-                Copy-Item `
-                    -Path $backupJar `
-                    -Destination $appJar `
-                    -Force
-
-                if (Test-Path $logPath) {
-                    Remove-Item $logPath -Force
-                }
-
-                if (Test-Path $errorLogPath) {
-                    Remove-Item $errorLogPath -Force
-                }
-
-                Write-Host "Starting restored application..."
-
-                $javaArguments = @(
-                    "-jar"
-                    "`"$appJar`""
-                    "--server.port=$env:APP_PORT"
-                )
-
-                Start-Process `
-                    -FilePath "javaw.exe" `
-                    -ArgumentList $javaArguments `
-                    -WorkingDirectory $deployDir `
-                    -RedirectStandardOutput $logPath `
-                    -RedirectStandardError $errorLogPath
-
-                Start-Sleep -Seconds 35
-
-                $restoredListener = Get-NetTCPConnection `
-                    -LocalPort ([int]$env:APP_PORT) `
-                    -State Listen `
-                    -ErrorAction SilentlyContinue
-
-                if ($restoredListener) {
-
-                    Write-Host "Rollback succeeded."
-
-                    Write-Host "Restored Crypto Market Data is listening on port $env:APP_PORT."
-
-                    Write-Host "PID: $($restoredListener.OwningProcess)"
-
-                } else {
-
-                    Write-Host "Rollback failed."
-
-                    Write-Host ""
-                    Write-Host "Application output:"
-
-                    if (Test-Path $logPath) {
-                        Get-Content $logPath
-                    }
-
-                    Write-Host ""
-                    Write-Host "Application errors:"
-
-                    if (Test-Path $errorLogPath) {
-                        Get-Content $errorLogPath
-                    }
-
-                    exit 1
-                }
-
-            '''
-
-            echo 'Check Jenkins Console Output.'
-
-            echo "Application log: ${DEPLOY_DIR}\\${APP_LOG}"
-
-            echo "Error log: ${DEPLOY_DIR}\\${APP_ERROR_LOG}"
-        }
-
-        always {
-
-            archiveArtifacts(
-                artifacts: 'target/*.jar',
-                fingerprint: true,
-                allowEmptyArchive: true
-            )
-        }
+        success { echo 'Collector built, tested and verified under WinSW ownership.' }
+        failure { echo 'Deployment failed. Inspect exact service/artifact state; no external Java rollback is permitted.' }
+        always { archiveArtifacts(artifacts: 'target/*.jar', fingerprint: true, allowEmptyArchive: true) }
     }
 }
